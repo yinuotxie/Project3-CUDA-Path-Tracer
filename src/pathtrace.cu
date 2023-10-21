@@ -18,6 +18,7 @@
 #include "intersections.h"
 #include "interactions.h"
 #include "main.h"
+#include "denoiser.h"
 
 
 #define ERRORCHECK 1
@@ -105,6 +106,49 @@ __global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution,
 	}
 }
 
+__global__ void gbufferToPBO(uchar4* pbo, glm::ivec2 resolution, GBufferPixel* gBuffer,
+	int iter, bool showGbuffer, bool showNormal) {
+	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+
+	if (x < resolution.x && y < resolution.y) {
+		int index = x + (y * resolution.x);
+
+		glm::vec3 buffer;
+
+		if (showGbuffer) {
+			buffer = glm::vec3(gBuffer[index].t);
+		}
+		else if (showNormal) {
+			buffer = glm::abs(gBuffer[index].normal);
+		}
+		else {
+			buffer = gBuffer[index].t > 0 ? glm::abs(gBuffer[index].pos) / static_cast<float>(iter) : glm::vec3(0.f);
+		}
+
+		pbo[index].w = 0;
+		pbo[index].x = buffer.x * 255.0;
+		pbo[index].y = buffer.y * 255.0;
+		pbo[index].z = buffer.z * 255.0;
+	}
+}
+
+__global__ void generateGBuffer(
+	int num_paths,
+	ShadeableIntersection* shadeableIntersections,
+	PathSegment* pathSegments,
+	GBufferPixel* gBuffer, Camera cam) {
+	int idx = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (idx < num_paths)
+	{
+		gBuffer[idx].t = shadeableIntersections[idx].t;
+
+		gBuffer[idx].normal = shadeableIntersections[idx].surfaceNormal;
+		gBuffer[idx].pos = getWorldPos(pathSegments[idx].ray, shadeableIntersections[idx].t);
+	}
+}
+
 static Scene* hst_scene = NULL;
 static GuiDataContainer* guiData = NULL;
 static glm::vec3* dev_image = NULL;
@@ -115,12 +159,11 @@ static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
 static PathSegment* dev_cache_paths = NULL;
 static ShadeableIntersection* dev_first_bounce_intersections = NULL;
-static int* dev_stencil = NULL;
 
-// for bvh 
-#if USE_BVH
+static int* dev_stencil = NULL;
+static GBufferPixel* dev_gBuffer = NULL;
 static LinearBVHNode* dev_bvh = NULL;
-#endif
+
 
 void InitDataContainer(GuiDataContainer* imGuiData)
 {
@@ -152,6 +195,8 @@ void pathtraceInit(Scene* scene) {
 
 	cudaMalloc(&dev_stencil, pixelcount * sizeof(int));
 
+	cudaMalloc(&dev_gBuffer, pixelcount * sizeof(GBufferPixel));
+
 #if USE_BVH
 	cudaMalloc(&dev_bvh, scene->bvh.size() * sizeof(LinearBVHNode));
 	cudaMemcpy(dev_bvh, scene->bvh.data(), scene->bvh.size() * sizeof(LinearBVHNode), cudaMemcpyHostToDevice);
@@ -169,6 +214,10 @@ void pathtraceFree() {
 	cudaFree(dev_intersections);
 	cudaFree(dev_first_bounce_intersections);
 	cudaFree(dev_stencil);
+
+#if USE_BVH
+	cudaFree(dev_bvh);
+#endif
 
 	checkCUDAError("pathtraceFree");
 }
@@ -525,6 +574,13 @@ void pathtrace(uchar4* pbo, int frame, int iter) {
 	// --- PathSegment Tracing Stage ---
 	// Shoot ray into scene, bounce between objects, push shading chunks
 	bool iterationComplete = false;
+
+	// Empty gbuffer
+	cudaMemset(dev_gBuffer, 0, pixelcount * sizeof(GBufferPixel));
+
+	// clean shading chunks
+	cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
+
 	while (!iterationComplete) {
 		// clean shading chunks
 		// cudaMemset(dev_intersections, 0, num_paths * sizeof(ShadeableIntersection));
@@ -566,7 +622,11 @@ void pathtrace(uchar4* pbo, int frame, int iter) {
 #endif
 		}
 
-		cudaDeviceSynchronize();
+		if (depth == 0) {
+			generateGBuffer << <numblocksPathSegmentTracing, blockSize1d >> > (num_paths, dev_intersections,
+				dev_paths, dev_gBuffer, cam);
+		}
+
 		depth++;
 
 #if PRINT_DEPTH
@@ -613,6 +673,91 @@ void pathtrace(uchar4* pbo, int frame, int iter) {
 		pixelcount * sizeof(glm::vec3), cudaMemcpyDeviceToHost);
 
 	checkCUDAError("pathtrace");
+}
+
+// CHECKITOUT: this kernel "post-processes" the gbuffer/gbuffers into something that you can visualize for debugging.
+void showGBuffer(uchar4* pbo, int iteration, bool showGbuffer, bool showNormal) {
+	const Camera& cam = hst_scene->state.camera;
+	const dim3 blockSize2d(8, 8);
+	const dim3 blocksPerGrid2d(
+		(cam.resolution.x + blockSize2d.x - 1) / blockSize2d.x,
+		(cam.resolution.y + blockSize2d.y - 1) / blockSize2d.y);
+
+	// CHECKITOUT: process the gbuffer results and send them to OpenGL buffer for visualization
+	gbufferToPBO << <blocksPerGrid2d, blockSize2d >> > (pbo, cam.resolution, dev_gBuffer, iteration,
+		showGbuffer, showNormal);
+}
+
+void showImage(uchar4* pbo, int iter) {
+	const Camera& cam = hst_scene->state.camera;
+	const dim3 blockSize2d(8, 8);
+	const dim3 blocksPerGrid2d(
+		(cam.resolution.x + blockSize2d.x - 1) / blockSize2d.x,
+		(cam.resolution.y + blockSize2d.y - 1) / blockSize2d.y);
+
+	// Send results to OpenGL buffer for rendering
+	sendImageToPBO << <blocksPerGrid2d, blockSize2d >> > (pbo, cam.resolution, iter, dev_image);
+}
+
+// Apply Edge-Avoiding A-Trous Wavelet Denoiser
+void denoiser(uchar4* pbo, int iter) {
+	// 2D block for generating ray from camera
+	const Camera& cam = hst_scene->state.camera;
+	int pixelcount = cam.resolution.x * cam.resolution.y;
+
+	const dim3 blockSize2d(8, 8);
+	const dim3 blocksPerGrid2d(
+		(cam.resolution.x + blockSize2d.x - 1) / blockSize2d.x,
+		(cam.resolution.y + blockSize2d.y - 1) / blockSize2d.y);
+
+	initDenoiser();
+	cudaMalloc(&dev_denoised_curr_image, pixelcount * sizeof(glm::vec3));
+	cudaMemcpy(dev_denoised_curr_image, dev_image, pixelcount * sizeof(glm::vec3),
+		cudaMemcpyDeviceToDevice);
+
+	cudaMalloc(&dev_denoised_next_image, pixelcount * sizeof(glm::vec3));
+	cudaMemset(dev_denoised_next_image, 0, pixelcount * sizeof(glm::vec3));
+
+	/*cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+
+	cudaEventRecord(start);*/
+	for (int i = 0; i <= hst_scene->state.filterSize; ++i) {
+		size_t stepwidth = 1 << i;
+
+		denoiserKernel << <blocksPerGrid2d, blockSize2d >> > (
+			dev_denoised_curr_image,
+			dev_denoised_next_image,
+			dev_gBuffer,
+			cam.resolution,
+			stepwidth,
+			hst_scene->state.c_phi,
+			hst_scene->state.n_phi,
+			hst_scene->state.p_phi,
+			iter
+			);
+		checkCUDAError("Denoiser Failed!");
+
+		std::swap(dev_denoised_curr_image, dev_denoised_next_image);
+	}
+	//cudaDeviceSynchronize();
+	//cudaEventRecord(stop);
+	//cudaEventSynchronize(stop);
+
+	//// Calculate and print the elapsed time in milliseconds
+	//float milliseconds = 0;
+	//cudaEventElapsedTime(&milliseconds, start, stop);
+	//printf("Denoiser running time: %.3f ms\n", milliseconds);
+
+	//// Destroy the CUDA events
+	//cudaEventDestroy(start);
+	//cudaEventDestroy(stop);
+
+	sendImageToPBO << <blocksPerGrid2d, blockSize2d >> > (pbo, cam.resolution, iter, dev_denoised_curr_image);
+	// cudaMemcpy(dev_image, dev_denoised_curr_image, pixelcount * sizeof(glm::vec3), cudaMemcpyDeviceToDevice);
+	// sendImageToPBO << <blocksPerGrid2d, blockSize2d >> > (pbo, cam.resolution, iter, dev_image);
+	denoiserFree();
 }
 
 

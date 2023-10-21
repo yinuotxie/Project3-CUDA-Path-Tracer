@@ -9,7 +9,7 @@
 #include "sceneStructs.h"
 #include "bound.h"
 #include "geom.h"
-#include "Mesh/tiny_obj_loader.h"
+#include "../tinyobj/tiny_obj_loader.h"
 
 #define USE_BVH 1
 #define DEBUG_BVH 0

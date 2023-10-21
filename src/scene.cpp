@@ -3,8 +3,8 @@
 #include <cstring>
 #include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtx/string_cast.hpp>
-#include "Mesh/objLoader.h"
 #include <unordered_map>
+#include "../tinyobj/objLoader.h"
 
 string getDirectory(const string& path) {
     size_t found = path.find_last_of("/\\");
